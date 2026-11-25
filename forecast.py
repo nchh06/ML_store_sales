@@ -51,7 +51,59 @@ def load_data(directory):
     return dates, series, logs, promo, ids, sample, eda
 
 
-def features(dates, series, logs, promo, origin):
+def holiday_calendar(directory, dates, series):
+    """Cờ nghỉ theo địa bàn, tính theo ngày nghỉ thực tế sau điều chuyển."""
+    stores = pd.read_csv(directory / "stores.csv").set_index("store_nbr")
+    events = pd.read_csv(directory / "holidays_events.csv", parse_dates=["date"])
+    location = stores.loc[series.get_level_values("store_nbr")]
+    calendar = np.zeros((len(dates), len(series)), dtype=bool)
+    observed = events[~events.transferred & events.type.isin(["Holiday", "Transfer", "Additional", "Bridge"])]
+    for event in observed.itertuples():
+        if event.date not in dates:
+            continue
+        applies = np.ones(len(series), dtype=bool)
+        if event.locale == "Local":
+            applies = location.city.to_numpy() == event.locale_name
+        elif event.locale == "Regional":
+            applies = location.state.to_numpy() == event.locale_name
+        calendar[dates.get_loc(event.date)] |= applies
+    return calendar
+
+
+def local_forecast(dates, series, logs, promo, origin, calendar):
+    """Ridge riêng cho mỗi chuỗi. Quan sát gần đây có trọng số lớn hơn."""
+    start = max(0, origin - 364)
+    stop = origin + HORIZON
+    days = dates[start:stop]
+    n_train = origin - start
+    weekday = np.eye(7)[days.day_of_week]
+    # Chu kỳ nửa tháng và tháng cho phép đáp ứng trơn quanh kỳ trả lương.
+    angle = 2 * np.pi * (days.day.to_numpy() - 1) / days.days_in_month.to_numpy()
+    common = np.column_stack([np.ones(len(days)), weekday, np.cos(angle), np.sin(angle),
+                              np.cos(2*angle), np.sin(2*angle)])
+    recent = np.exp2((np.arange(n_train) - n_train + 1) / 48)
+    forecast = np.zeros((HORIZON, len(series)), dtype=np.float32)
+    for store in series.get_level_values("store_nbr").unique():
+        cols = np.flatnonzero(series.get_level_values("store_nbr") == store)
+        y = logs[start:origin, cols].T
+        active_day = np.nansum(y, axis=0) > 0
+        # Tách thời kỳ trước khi cửa hàng mở và các ngày cửa hàng đóng cửa.
+        weight = recent * active_day * np.isfinite(y)
+        promotions = np.nan_to_num(promo[start:stop, cols].T, nan=0.)
+        common_block = np.broadcast_to(common, (len(cols), *common.shape))
+        features = np.concatenate([common_block, np.log1p(promotions)[:, :, None],
+                                   (promotions > 0)[:, :, None],
+                                   calendar[start:stop, cols].T[:, :, None]], axis=2)
+        train = features[:, :n_train]
+        weighted = train.transpose(0, 2, 1) * weight[:, None, :]
+        penalty = np.eye(train.shape[2]) * 1.5
+        penalty[0, 0] = .01
+        coeff = np.linalg.solve(weighted @ train + penalty, weighted @ np.nan_to_num(y)[:, :, None])
+        forecast[:, cols] = (features[:, n_train:] @ coeff)[:, :, 0].T
+    return np.maximum(forecast, 0)
+
+
+def features(dates, series, logs, promo, origin, calendar=None):
     """Mỗi cửa sổ lịch sử kết thúc trước ngày đầu của đợt dự báo."""
     if origin < 84:
         raise ValueError("Cần ít nhất 84 ngày lịch sử")
@@ -59,10 +111,39 @@ def features(dates, series, logs, promo, origin):
     history_promo = promo[origin-84:origin]
     weekday = dates[origin-84:origin].day_of_week
     n = len(series)
+    if calendar is None:
+        calendar = np.zeros_like(promo, dtype=bool)
+    local = local_forecast(dates, series, logs, promo, origin, calendar)
+    store = series.get_level_values("store_nbr")
+    family = series.get_level_values("family")
+    if origin >= 392:
+        annual_ref = np.nanmean(logs[origin-392:origin-364], axis=0)
+    else:
+        annual_ref = np.nanmean(history[-28:], axis=0)
     frames = []
     for lead, day in enumerate(dates[origin:origin + HORIZON]):
         matching = history[weekday == day.day_of_week]
+        previous_year = origin + lead - 364
+        seasonal = (np.nanmean(logs[previous_year-7:previous_year+8], axis=0)
+                    if previous_year >= 7 else np.nanmean(history, axis=0))
+        target_promo = promo[origin + lead]
+        matching_promo = np.isclose(np.log1p(history_promo), np.log1p(target_promo), atol=.30)
+        count = matching_promo.sum(axis=0)
+        conditional = (np.nansum(np.where(matching_promo, history, 0), axis=0)
+                       + 5 * np.nanmean(history, axis=0)) / (count + 5)
         frame = pd.DataFrame({
+            "local_ridge": local[lead],
+            "season_last_year": seasonal,
+            "promo_conditional": conditional,
+            "promo_weekday": np.nanmean(np.log1p(history_promo[weekday == day.day_of_week]), axis=0),
+            "level_3": np.nanmean(history[-3:], axis=0),
+            "store_promo": np.log1p(pd.Series(target_promo).groupby(store).transform("sum").to_numpy()),
+            "holiday": calendar[origin + lead],
+            "season_change": seasonal - annual_ref,
+            "peer_promo": np.log1p(pd.Series(target_promo).groupby(family).transform("mean").to_numpy()),
+            "promo_diff": np.log1p(target_promo) - np.nanmean(np.log1p(history_promo), axis=0),
+            "half_month": (day.day - 1) % 15,
+            "month": day.month,
             "level_7": np.nanmean(history[-7:], axis=0),
             "level_28": np.nanmean(history[-28:], axis=0),
             "level_84": np.nanmean(history, axis=0),
@@ -81,15 +162,19 @@ def features(dates, series, logs, promo, origin):
     return pd.concat(frames, ignore_index=True).fillna(0).astype("float32")
 
 
-def fit_models(dates, series, logs, promo, origin):
-    origins = range(origin - 10 * HORIZON, origin, HORIZON)
-    x = pd.concat([features(dates, series, logs, promo, t) for t in origins], ignore_index=True)
-    y = logs[origin - 10 * HORIZON:origin].ravel()
+def fit_models(dates, series, logs, promo, origin, calendar):
+    # Thêm các cửa sổ quanh cùng mùa năm trước để học các đợt tăng theo năm.
+    recent = list(range(origin - 12 * HORIZON, origin, HORIZON))
+    seasonal = list(range(origin - 364 - 2 * HORIZON, origin - 364 + 4 * HORIZON, HORIZON))
+    origins = [t for t in seasonal + recent if t >= 84 and t + HORIZON <= origin]
+    x = pd.concat([features(dates, series, logs, promo, t, calendar) for t in origins], ignore_index=True)
+    y = np.concatenate([logs[t:t + HORIZON].ravel() for t in origins])
     valid = np.isfinite(y)
     x = x.loc[valid]
-    residual = y[valid] - x.weekday_4.to_numpy()
+    residual = y[valid] - x.local_ridge.to_numpy()
     models = {
-        "Boosting": HistGradientBoostingRegressor(max_iter=110, learning_rate=.09, max_leaf_nodes=31,
+        "Boosting": HistGradientBoostingRegressor(max_iter=260, learning_rate=.075, max_leaf_nodes=31,
+                                                  categorical_features=["family", "store", "weekday", "month"],
                                                   early_stopping=False, random_state=SEED),
         "MLP": make_pipeline(StandardScaler(), MLPRegressor(hidden_layer_sizes=(48, 24), max_iter=32,
                             batch_size=1024, early_stopping=True, random_state=SEED)),
@@ -100,7 +185,7 @@ def fit_models(dates, series, logs, promo, origin):
 
 
 def predict(model, x):
-    return np.maximum(0, x.weekday_4.to_numpy() + model.predict(x))
+    return np.maximum(0, x.local_ridge.to_numpy() + model.predict(x))
 
 
 def rmse(y, p):
@@ -109,13 +194,14 @@ def rmse(y, p):
 
 def run(directory, output):
     dates, series, logs, promo, ids, sample, eda = load_data(directory)
+    calendar = holiday_calendar(directory, dates, series)
     end = len(dates) - HORIZON
     result = {"eda": eda, "folds": []}
     # Chọn trọng số ở đợt thứ nhất, giữ cố định khi đánh giá ở đợt thứ hai.
     for origin in (end - 2 * HORIZON, end - HORIZON, end):
         print(f"Huấn luyện tại mốc {dates[origin].date()}", flush=True)
-        models = fit_models(dates, series, logs, promo, origin)
-        x = features(dates, series, logs, promo, origin)
+        models = fit_models(dates, series, logs, promo, origin, calendar)
+        x = features(dates, series, logs, promo, origin, calendar)
         tree, mlp = [predict(model, x) for model in models.values()]
         if origin == end:
             break
@@ -127,7 +213,7 @@ def run(directory, output):
             result["tree_weight"] = weight
         blend = weight * tree + (1-weight) * mlp
         scores = {name: rmse(y, pred) for name, pred in
-                  [("Baseline", x.weekday_4), ("Boosting", tree), ("MLP", mlp), ("Blend", blend)]}
+                  [("Baseline", x.weekday_4), ("Ridge", x.local_ridge), ("Boosting", tree), ("MLP", mlp), ("Blend", blend)]}
         result["folds"].append({"start": str(dates[origin].date()), "scores": scores})
         if origin == end - HORIZON:
             gaps = {}
