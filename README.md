@@ -21,21 +21,23 @@ python -m unittest -v test_forecast
 python make_report.py
 ```
 
-`forecast.py` xuất `results.json` và thay thế `submission.csv`. Dùng `--out` để chọn thư mục kết quả khác. `make_report.py` đọc `results.json` trong thư mục hiện tại và tạo lại báo cáo. Notebook chứa mã dự báo độc lập, dùng thư viện có sẵn của Kaggle. Để tái lập theo byte, dùng môi trường local đã ghim phiên bản. SHA-256 của file nộp đã kiểm tra là `3c15dfa1a11481e22a5be627e09d7988f94b826b6fbaae3961ead2cba2f3b1b6`.
+`forecast.py` xuất `results.json` và thay thế `submission.csv`. Dùng `--out` để chọn thư mục kết quả khác. `make_report.py` đọc `results.json` trong thư mục hiện tại và tạo lại báo cáo. Notebook chứa mã dự báo độc lập, dùng thư viện có sẵn của Kaggle. Để tái lập theo byte, dùng môi trường local đã ghim phiên bản. SHA-256 của file nộp đã kiểm tra là `c3e4a3ee66f2d267d6e10cafe27b689838a5a67327fbeac41b1b51fb775731a0`.
 
 ## Kết quả kiểm định
 
 Mô hình Ridge riêng cho từng cặp cửa hàng và nhóm hàng dùng tối đa 364 ngày lịch sử. Trọng số quan sát giảm một nửa sau 48 ngày. Lịch nghỉ phản ánh cả phạm vi địa lý và ngày nghỉ được điều chuyển. Boosting và MLP học phần chênh so với Ridge trên 12 cửa sổ 16 ngày liên tiếp gần nhất cùng 6 cửa sổ quanh cùng mùa năm trước. Mô hình có thể so sánh khuyến mãi hiện tại với lịch sử cùng thứ và với các cửa hàng bán cùng nhóm hàng.
 
-Tỷ lệ kết hợp là 50% boosting và 50% MLP trên thang log, được chọn ở đợt 15–30/07/2017 rồi giữ cố định cho file nộp. Bảng dưới so sánh RMSLE của hai phiên bản trên cùng bộ nhãn. Điểm thấp hơn tốt hơn.
+LightGBM huấn luyện thêm một mô hình cho mỗi nhóm hàng trên tối đa 900 ngày. Nhánh này dự báo trực tiếp log-doanh số từ đặc trưng theo ngày chốt. Hai nhánh Ridge đã hiệu chỉnh chiếm 50% và LightGBM trực tiếp chiếm 50% của tổ hợp. Khi một cửa hàng có ít nhất ba ngày liên tiếp với tổng số mặt hàng khuyến mãi bằng 0, các ngày đó dùng dự báo Ridge đã hiệu chỉnh. Quy tắc dự phòng này ảnh hưởng đến cửa sổ tháng 8/2016, không kích hoạt trong test tháng 8/2017.
 
-| Cửa sổ 16 ngày | Bản trước (c4b504c) | Bản mới |
+Ngày 16/08/2017, số mặt hàng khuyến mãi tăng đồng loạt trên nhiều nhóm hàng. Hàm `robust_promotions` so sánh phân vị 20 giữa các cửa hàng với các ngày cùng thứ trong 84 ngày trước và trong cửa sổ dự báo. Khi ít nhất 20% nhóm hàng (tối thiểu bốn nhóm) vượt ngưỡng, dùng 90% trung vị khuyến mãi của các ngày cùng thứ còn lại trong cửa sổ và 10% mức được cung cấp. Chỉ 16/08/2017 kích hoạt quy tắc trong test. Đây là giả định về độ tin cậy của tín hiệu khuyến mãi. Doanh số thật của ngày này thuộc tập Kaggle chấm.
+
+| Cửa sổ 16 ngày | Phiên bản b898b96 | Phiên bản hiện tại |
 |---|---:|---:|
-| 16–31/08/2016, đối chiếu cùng mùa | 0,7801 | 0,6934 |
-| 29/06–14/07/2017, đối chiếu thêm | 0,3795 | 0,3704 |
-| 15–30/07/2017, chọn trọng số | 0,3964 | 0,3930 |
-| 31/07–15/08/2017, so sánh cuối | 0,4166 | 0,3977 |
+| 16–31/08/2016, cùng mùa | 0,69335 | 0,68969 |
+| 13–28/06/2017 | 0,38424 | 0,37865 |
+| 15–30/07/2017, chọn tỷ lệ cho hai nhánh Ridge | 0,39296 | 0,39194 |
+| 31/07–15/08/2017 | 0,39775 | 0,39004 |
 
-Các mốc lịch sử dùng để so sánh hồi cứu. Hai mốc cuối đã từng được xem ở phiên bản trước. Mỗi lần fit chỉ sử dụng nhãn trước ngày bắt đầu dự báo tương ứng. Điểm từng thành phần, sai số theo nhóm hàng và kết quả hoán vị đặc trưng nằm trong `results.json`. MLP chạm giới hạn 32 epoch trong lần chạy này. Điểm leaderboard cần được ghi nhận sau khi nộp file cho 16–31/08/2017.
+Bảng so sánh sử dụng cùng các nhãn lịch sử. Các mốc đã được xem trong quá trình phát triển. Phép thử độ nhạy riêng trên 31/07/2017 can thiệp giả lập vào số khuyến mãi tại mọi cửa hàng. RMSLE của nhánh cũ trong ngày đó là 0,39074 với dữ liệu gốc, 1,05588 với cú sốc giả lập và 0,43260 sau xử lý. Phép thử chỉ đánh giá phản ứng với đầu vào biến động.
 
-Bản nộp trước được lưu trong lịch sử Git. Có thể xuất riêng bằng `git show c4b504c:submission.csv > submission_previous.csv`.
+Public Score do người nộp ghi nhận cho bản trước là **0,44587**. Điểm của bản hiện tại cần cập nhật từ Kaggle sau khi nộp. Dùng `git show b898b96:submission.csv > submission_previous.csv` để xuất lại bản trước.

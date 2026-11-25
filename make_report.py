@@ -84,6 +84,10 @@ block(s,.65,3.05,5.8,"Gradient boosting","260 vòng boosting trên histogram, t�
 block(s,6.65,3.05,5.8,"Mạng MLP","Chuẩn hóa đặc trưng, dùng hai tầng ẩn ReLU gồm 48 và 24 nút. Adam học phần chênh so với Ridge, tối đa 32 epoch.")
 label(s,.65,5.65,12,1,"Mô hình hiệu chỉnh dùng thêm mức bán cùng mùa năm trước và mức khuyến mãi của cùng nhóm hàng trên toàn mạng lưới.",18,muted)
 
+s = slide("Phương pháp", "LightGBM dự báo trực tiếp theo nhóm hàng")
+block(s,.65,2,5.8,"33 mô hình riêng","Mỗi mô hình học từ tối đa 900 ngày của tất cả cửa hàng bán cùng nhóm hàng. Đầu vào gồm lịch sử theo thứ, mức bán gần đây, cùng kỳ năm trước và độ phủ khuyến mãi.")
+block(s,6.65,2,5.8,"Khuyến mãi bất thường","Nếu ít nhất 20% nhóm hàng tăng khuyến mãi đồng loạt vượt ngưỡng lịch sử và các ngày cùng thứ, giảm trọng số số liệu ngày đó xuống 10%.")
+label(s,.65,5.3,12,1.3,"Lấy trung bình dự báo LightGBM và dự báo Ridge đã hiệu chỉnh. Khi cả cửa hàng có ít nhất ba ngày liền không khuyến mãi, dùng riêng nhánh Ridge đã hiệu chỉnh cho các ngày đó.",18)
 s = slide("Thiết kế thực nghiệm", "Mô phỏng đúng thời điểm phải dự báo")
 for i,(title,body) in enumerate([
     ("15–30/07  ·  Chọn trọng số","Thử 5 tỷ lệ boosting từ 0% đến 100% trên thang log, chọn tỷ lệ cho RMSLE nhỏ nhất."),
@@ -101,10 +105,10 @@ c.plots[0].has_data_labels = True
 c.plots[0].data_labels.number_format = "0.000"
 c.plots[0].data_labels.font.size = Pt(11)
 delta = 1-fold2["scores"]["Blend"]/fold2["scores"]["Baseline"]
-label(s,.65,5.95,12,.9,f"Trọng số đã chọn: boosting {w:.0%}, MLP {1-w:.0%}. So với baseline, RMSLE giảm {delta:.1%} trên đợt kiểm định cuối.",18)
+label(s,.65,5.95,12,.9,f"LightGBM theo nhóm hàng chiếm 50%. Hai nhánh còn lại chia đều 50%. So với baseline, RMSLE giảm {delta:.1%} trên đợt kiểm định cuối.",18)
 
 s = slide("Đối chiếu phiên bản", "Bản mới giảm sai số trên cả hai mốc tháng 7")
-old = [0.3963572727916202, 0.41662602388487846]  # results.json tại commit c4b504c
+old = [0.39296134732592264, 0.3977487906232108]  # results.json tại commit b898b96
 current = [f["scores"]["Blend"] for f in r["folds"]]
 c = chart(s, ["15–30/07", "31/07–15/08"],
           {"Bản trước": old, "Bản mới": current}, XL_CHART_TYPE.COLUMN_CLUSTERED, 3.65, "0.00")
@@ -126,7 +130,7 @@ daily = r["daily_error"]
 label(s,.65,5.65,12,1.15,f"Trên đợt cuối, nhóm {top[-1][0]} có RMSLE cao nhất ({top[-1][1]:.3f}). Theo ngày, RMSLE dao động từ {min(daily):.3f} đến {max(daily):.3f}. Các cửa sổ mùa hè chỉ phản ánh một phần biến động trong năm.",17)
 
 s = slide("Kết luận", "Từ kiểm định đến file nộp")
-block(s,.65,2,5.85,"Phương án nộp",f"Kết hợp hai dự báo log theo tỷ lệ {w:.0%} / {1-w:.0%}. Đổi ngược bằng expm1, ghép đúng id của test với thứ tự của mẫu nộp.")
-block(s,6.65,2,5.85,"Đo lường",f"RMSLE kiểm định cuối là {fold2['scores']['Blend']:.4f}. Điểm leaderboard do Kaggle tính sau khi nhóm nộp.")
+block(s,.65,2,5.85,"Phương án nộp",f"Kết hợp các dự báo trên thang log rồi đổi ngược bằng expm1. Dùng thứ tự id của mẫu nộp.")
+block(s,6.65,2,5.85,"Đo lường",f"RMSLE kiểm định cuối là {fold2['scores']['Blend']:.4f}. Bản trước có Public Score 0,44587 theo kết quả nhóm ghi nhận. Bản mới chờ Kaggle chấm.")
 label(s,.65,4.85,12,1.4,"Các bước tái lập và phiên bản thư viện có trong README. Dữ liệu gốc thuộc cuộc thi Kaggle Store Sales – Time Series Forecasting của Corporación Favorita.",19)
 deck.save("report.pptx")

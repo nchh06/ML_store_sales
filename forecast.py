@@ -192,6 +192,116 @@ def rmse(y, p):
     return float(np.sqrt(np.mean((np.asarray(y, dtype=np.float64) - np.asarray(p)) ** 2)))
 
 
+def robust_promotions(dates, series, promo, origin):
+    """Giảm ảnh hưởng của một ngày có khuyến mãi tăng đồng loạt hiếm gặp."""
+    future = promo[origin:origin + HORIZON]
+    history = promo[max(0, origin - 84):origin]
+    history_days = dates[origin-len(history):origin].day_of_week
+    future_days = dates[origin:origin + HORIZON].day_of_week
+    families = series.get_level_values("family")
+    cols_by_family = [np.flatnonzero(families == f) for f in families.unique()]
+    # Mức tại phân vị 20 tăng khi phần lớn cửa hàng cùng tăng khuyến mãi.
+    observed = np.column_stack([np.quantile(future[:, cols], .2, axis=1) for cols in cols_by_family])
+    past = np.column_stack([np.quantile(history[:, cols], .2, axis=1) for cols in cols_by_family])
+    clean = promo.copy()
+    affected = []
+    for lead, weekday in enumerate(future_days):
+        prev = history_days == weekday
+        peers = (future_days == weekday) & (np.arange(len(future_days)) != lead)
+        if not peers.any():
+            continue
+        usual = np.fmax(np.nanquantile(past[prev], .95, axis=0), observed[peers].max(axis=0))
+        elevated = observed[lead] > usual + np.maximum(1, .4*usual)
+        if elevated.sum() < max(4, int(np.ceil(.2 * len(cols_by_family)))):
+            continue
+        # Chỉ tham chiếu số khuyến mãi cùng thứ đã có sẵn trong cửa sổ dự báo.
+        typical = np.median(future[peers], axis=0)
+        clean[origin+lead] = np.rint(.9*typical + .1*future[lead])
+        affected.append(str(dates[origin+lead].date()))
+    return clean, affected
+
+
+def direct_forecast(dates, series, logs, promo, origin, calendar):
+    """Mỗi nhóm hàng dùng toàn bộ cửa hàng để học trực tiếp log-doanh số."""
+    from lightgbm import LGBMRegressor
+
+    start = max(392, origin - 900)
+    target = np.arange(start, origin + HORIZON)
+    # Mỗi khối lịch sử và khối cần dự báo đều dùng cùng một mốc chốt 16 ngày.
+    lead = (target - origin) % HORIZON
+    cutoff = target - lead
+    days = dates[target]
+    result = np.zeros((HORIZON, len(series)), dtype=float)
+    for family in series.get_level_values("family").unique():
+        cols = np.flatnonzero(series.get_level_values("family") == family)
+        n = len(cols)
+        y = logs[:origin + HORIZON, cols].astype(float)
+        # Các nhãn sau mốc luôn bị che cả khi chạy trên cửa sổ có đáp án.
+        y[origin:] = np.nan
+        offers = promo[:origin + HORIZON, cols]
+        def roll(arr, window):
+            return pd.DataFrame(arr).rolling(window, min_periods=1).mean().to_numpy()
+        def repeat(arr):
+            return np.repeat(np.asarray(arr), n)
+        def flat(arr):
+            return arr.reshape(-1)
+
+        shop = series.get_level_values("store_nbr").to_numpy()[cols]
+        days_count = len(target)
+        campaign = offers[target]
+        monthday = days.day.to_numpy()
+        data = {"store": np.tile(shop, days_count), "weekday": repeat(days.day_of_week),
+                "month": repeat(days.month), "day": repeat(monthday),
+                "day_in_year": repeat(days.day_of_year), "lead": repeat(lead),
+                "half_month": repeat((monthday-1) % 15),
+                "holiday": flat(calendar[target][:,cols]),
+                "promo": flat(np.log1p(campaign)),
+                "promo_chain": repeat(np.log1p(np.nan_to_num(campaign).mean(axis=1))),
+                "coverage": repeat((campaign>0).mean(axis=1)),
+                "last": flat(y[cutoff-1]), "last_promo": flat(np.log1p(offers[cutoff-1])),
+                "previous_year": flat(roll(y, 15)[target-364+7]),
+                "previous_year_level": flat(roll(y, 28)[cutoff-365])}
+        for window in (3,7,14,28,56,140):
+            data[f"level_{window}"] = flat(roll(y,window)[cutoff-1])
+        weekly = target - 7 * (1 + lead // 7)
+        data["weekly"] = flat(y[weekly])
+        for window in (4,12):
+            data[f"weekday_{window}"] = flat(np.nanmean(np.stack([y[weekly-7*k] for k in range(window)]),axis=0))
+        data["active_share"] = flat(roll(y>0,56)[cutoff-1])
+        data["past_promo"] = flat(roll(np.log1p(offers),28)[cutoff-1])
+        data["trend"] = data["level_7"] - data["level_28"]
+        data["annual_trend"] = data["previous_year"] - data["previous_year_level"]
+        x = pd.DataFrame(data)
+        train = target < origin
+        labels = flat(y[target[train]])
+        valid = np.isfinite(labels)
+        train_size = len(labels)
+        model = LGBMRegressor(n_estimators=260, learning_rate=.045, num_leaves=23,
+                              min_child_samples=50, reg_lambda=4, n_jobs=2, deterministic=True,
+                              force_col_wise=True, verbosity=-1, random_state=SEED)
+        weights = repeat(.4+.6*np.exp2((target[train]-origin)/280))
+        model.fit(x.iloc[:train_size].loc[valid],labels[valid],sample_weight=weights[valid],
+                  categorical_feature=["store","weekday"])
+        result[:,cols] = model.predict(x.iloc[train_size:]).reshape(HORIZON, n)
+    return result.clip(0).ravel()
+
+
+def combine_forecasts(previous, direct, series, future_promo):
+    """Giữ dự báo cũ khi cả cửa hàng ngừng khuyến mãi nhiều ngày liền."""
+    store_ids = series.get_level_values("store_nbr")
+    blended = ((previous + direct) * .5).reshape(HORIZON, -1)
+    previous = previous.reshape(HORIZON, -1)
+    for store in store_ids.unique():
+        cols = np.flatnonzero(store_ids == store)
+        empty = (future_promo[:, cols] == 0).all(axis=1)
+        runs = empty[:-2] & empty[1:-1] & empty[2:]
+        mask = np.zeros(HORIZON, dtype=bool)
+        for offset in (0, 1, 2):
+            mask[offset:offset + len(runs)] |= runs
+        blended[np.ix_(mask, cols)] = previous[np.ix_(mask, cols)]
+    return blended.ravel()
+
+
 def run(directory, output):
     dates, series, logs, promo, ids, sample, eda = load_data(directory)
     calendar = holiday_calendar(directory, dates, series)
@@ -201,9 +311,14 @@ def run(directory, output):
     for origin in (end - 2 * HORIZON, end - HORIZON, end):
         print(f"Huấn luyện tại mốc {dates[origin].date()}", flush=True)
         models = fit_models(dates, series, logs, promo, origin, calendar)
-        x = features(dates, series, logs, promo, origin, calendar)
+        clean_promo, flagged = robust_promotions(dates, series, promo, origin)
+        direct = direct_forecast(dates, series, logs, clean_promo, origin, calendar)
+        x = features(dates, series, logs, clean_promo, origin, calendar)
         tree, mlp = [predict(model, x) for model in models.values()]
+        future_promo = promo[origin:origin + HORIZON]
         if origin == end:
+            result["adjusted_test_dates"] = flagged
+            blend = combine_forecasts(weight*tree + (1-weight)*mlp, direct, series, future_promo)
             break
         y = logs[origin:origin + HORIZON].ravel()
         if not np.isfinite(y).all():
@@ -211,9 +326,10 @@ def run(directory, output):
         if not result["folds"]:
             weight = min([0, .25, .5, .75, 1], key=lambda w: rmse(y, w*tree + (1-w)*mlp))
             result["tree_weight"] = weight
-        blend = weight * tree + (1-weight) * mlp
+        previous = weight * tree + (1-weight) * mlp
+        blend = combine_forecasts(previous, direct, series, future_promo)
         scores = {name: rmse(y, pred) for name, pred in
-                  [("Baseline", x.weekday_4), ("Ridge", x.local_ridge), ("Boosting", tree), ("MLP", mlp), ("Blend", blend)]}
+                  [("Baseline", x.weekday_4), ("Ridge", x.local_ridge), ("Boosting", tree), ("MLP", mlp), ("Direct", direct), ("Blend", blend)]}
         result["folds"].append({"start": str(dates[origin].date()), "scores": scores})
         if origin == end - HORIZON:
             gaps = {}
@@ -231,7 +347,7 @@ def run(directory, output):
             result["family_error"] = np.sqrt(group_error.groupby("family", observed=True).squared.mean()).to_dict()
             result["daily_error"] = np.sqrt(((y-blend).reshape(HORIZON,-1)**2).mean(axis=1)).tolist()
         print(scores, flush=True)
-    sales = np.expm1(weight*tree + (1-weight)*mlp)
+    sales = np.expm1(blend)
     predictions = pd.Series(sales, index=ids.to_numpy().ravel())
     sample["sales"] = sample.id.map(predictions)
     if not np.isfinite(sample.sales).all() or (sample.sales < 0).any():
